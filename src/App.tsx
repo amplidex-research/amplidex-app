@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   Activity,
   ArrowDownToLine,
@@ -175,7 +182,13 @@ function App() {
   const [address, setAddress] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>(() => tabFromLocation());
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [walletRestored, setWalletRestored] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [transactionLoading, setTransactionLoading] = useState(false);
+  const [positionsLoading, setPositionsLoading] = useState(false);
+  const [keeperLoading, setKeeperLoading] = useState(false);
+  const refreshInFlight = useRef(false);
   const [toast, setToast] = useState<Toast>(null);
   const [protocol, setProtocol] = useState<AnyMap | null>(null);
   const [markets, setMarkets] = useState<
@@ -399,52 +412,77 @@ function App() {
     setKeeperPositions(found);
   };
 
-  const refresh = async () => {
-    setLoading(true);
-    try {
-      const p = await safeRead(() =>
-        readContract(config.protocolId, "get_global_config")
-      );
-      setProtocol(p as AnyMap | null);
-      await loadKeeperDashboard(p as AnyMap | null);
+  const loadBaseData = useCallback(async (): Promise<AnyMap | null> => {
+    const protocolPromise = safeRead(() =>
+      readContract(config.protocolId, "get_global_config")
+    );
 
-      const loaded = await Promise.all(
-        config.markets.map(async (def) => ({
-          def,
-          cfg: (await safeRead(() =>
+    const marketsPromise = Promise.all(
+      config.markets.map(async (def) => {
+        const [cfg, pool, longRate, shortRate] = await Promise.all([
+          safeRead(() =>
             readContract(config.protocolId, "get_market", [
               sc.address(def.asset),
             ])
-          )) as AnyMap | null,
-          pool: (await safeRead(() =>
+          ),
+          safeRead(() =>
             readContract(config.protocolId, "get_pool", [sc.address(def.asset)])
-          )) as AnyMap | null,
-          longRate: (await safeRead(() =>
+          ),
+          safeRead(() =>
             readContract(config.protocolId, "get_borrow_rate", [
               sc.address(def.asset),
               sc.side("Long"),
             ])
-          )) as AnyMap | null,
-          shortRate: (await safeRead(() =>
+          ),
+          safeRead(() =>
             readContract(config.protocolId, "get_borrow_rate", [
               sc.address(def.asset),
               sc.side("Short"),
             ])
-          )) as AnyMap | null,
-        }))
-      );
-      setMarkets(loaded);
+          ),
+        ]);
 
+        return {
+          def,
+          cfg: cfg as AnyMap | null,
+          pool: pool as AnyMap | null,
+          longRate: longRate as AnyMap | null,
+          shortRate: shortRate as AnyMap | null,
+        };
+      })
+    );
+
+    const [rawProtocol, loadedMarkets] = await Promise.all([
+      protocolPromise,
+      marketsPromise,
+    ]);
+
+    const nextProtocol = rawProtocol as AnyMap | null;
+    setProtocol(nextProtocol);
+    setMarkets(loadedMarkets);
+
+    return nextProtocol;
+  }, []);
+
+  const loadPools = useCallback(
+    async (owner: string | null) => {
       const loadedPools: PoolView[] = await Promise.all(
         poolAssets.map(async (def) => {
-          const pool = (await safeRead(() =>
-            readContract(config.protocolId, "get_pool", [sc.address(def.asset)])
-          )) as AnyMap | null;
-          const rateConfig = (await safeRead(() =>
-            readContract(config.protocolId, "get_interest_rate_config", [
-              sc.address(def.asset),
-            ])
-          )) as AnyMap | null;
+          const [rawPool, rawRateConfig] = await Promise.all([
+            safeRead(() =>
+              readContract(config.protocolId, "get_pool", [
+                sc.address(def.asset),
+              ])
+            ),
+            safeRead(() =>
+              readContract(config.protocolId, "get_interest_rate_config", [
+                sc.address(def.asset),
+              ])
+            ),
+          ]);
+
+          const pool = rawPool as AnyMap | null;
+          const rateConfig = rawRateConfig as AnyMap | null;
           const totalAssets = asBigInt(pool?.total_assets);
           const totalBorrowed = asBigInt(pool?.total_borrowed);
           const utilizationBps =
@@ -458,6 +496,7 @@ function App() {
             utilizationBps,
             asBigInt(rateConfig?.reserve_factor_bps)
           );
+
           return {
             def,
             pool,
@@ -467,37 +506,121 @@ function App() {
             supplyAprBps,
             availableLiquidity:
               totalAssets > totalBorrowed ? totalAssets - totalBorrowed : 0n,
-            user: address ? await loadLpPosition(address, def, pool) : null,
+            user: owner ? await loadLpPosition(owner, def, pool) : null,
           };
         })
       );
-      setPools(loadedPools);
 
-      if (address) {
-        const balances: WalletBalance[] = await Promise.all(
-          poolAssets.map(async (def) => {
-            const value = await safeRead(() =>
-              readContract(def.asset, "balance", [sc.address(address)], address)
-            );
-            return {
-              def,
-              balance: value === null ? null : asBigInt(value),
-            };
-          })
-        );
-        setWalletBalances(balances);
-      } else {
+      setPools(loadedPools);
+    },
+    [poolAssets]
+  );
+
+  const loadWalletBalances = useCallback(
+    async (owner: string | null) => {
+      if (!owner) {
         setWalletBalances([]);
+        return;
       }
 
-      await loadPositions(address);
+      const balances: WalletBalance[] = await Promise.all(
+        poolAssets.map(async (def) => {
+          const value = await safeRead(() =>
+            readContract(def.asset, "balance", [sc.address(owner)], owner)
+          );
+
+          return {
+            def,
+            balance: value === null ? null : asBigInt(value),
+          };
+        })
+      );
+
+      setWalletBalances(balances);
+    },
+    [poolAssets]
+  );
+
+  const loadCurrentRoute = useCallback(
+    async (
+      currentTab: Tab,
+      owner: string | null,
+      currentProtocol: AnyMap | null
+    ) => {
+      if (currentTab === "positions") {
+        setPositionsLoading(true);
+        try {
+          await loadPositions(owner);
+        } finally {
+          setPositionsLoading(false);
+        }
+        return;
+      }
+
+      if (currentTab === "keeper") {
+        setKeeperLoading(true);
+        try {
+          let keeperConfig = currentProtocol;
+          if (!keeperConfig) {
+            keeperConfig = (await safeRead(() =>
+              readContract(config.protocolId, "get_global_config")
+            )) as AnyMap | null;
+            if (keeperConfig) setProtocol(keeperConfig);
+          }
+          await loadKeeperDashboard(keeperConfig);
+        } finally {
+          setKeeperLoading(false);
+        }
+      }
+    },
+    []
+  );
+
+  const loadCommonData = useCallback(
+    async (owner: string | null): Promise<AnyMap | null> => {
+      const protocolPromise = loadBaseData();
+
+      await Promise.all([
+        protocolPromise,
+        loadPools(owner),
+        loadWalletBalances(owner),
+      ]);
+
+      return protocolPromise;
+    },
+    [loadBaseData, loadPools, loadWalletBalances]
+  );
+
+  const refresh = useCallback(async () => {
+    if (refreshInFlight.current) return;
+
+    refreshInFlight.current = true;
+    setRefreshing(true);
+
+    try {
+      const nextProtocol = await loadCommonData(address);
+      await loadCurrentRoute(tab, address, nextProtocol);
     } finally {
-      setLoading(false);
+      refreshInFlight.current = false;
+      setRefreshing(false);
+      setInitialLoading(false);
     }
-  };
+  }, [address, tab, loadCommonData, loadCurrentRoute]);
 
   useEffect(() => {
-    restoreWallet().then(setAddress);
+    let active = true;
+
+    void restoreWallet()
+      .then((restoredAddress) => {
+        if (active) setAddress(restoredAddress);
+      })
+      .finally(() => {
+        if (active) setWalletRestored(true);
+      });
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -507,22 +630,53 @@ function App() {
   }, []);
 
   useEffect(() => {
-    void refresh();
-  }, [address]);
+    if (!walletRestored) return;
+
+    let active = true;
+    setInitialLoading(true);
+
+    void loadCommonData(address)
+      .catch((error) => {
+        if (active) {
+          notify(
+            "error",
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      })
+      .finally(() => {
+        if (active) setInitialLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [address, walletRestored, loadCommonData]);
+
+  useEffect(() => {
+    if (!walletRestored) return;
+    if (tab !== "positions" && tab !== "keeper") return;
+
+    void loadCurrentRoute(tab, address, protocol).catch((error) => {
+      notify("error", error instanceof Error ? error.message : String(error));
+    });
+  }, [tab, address, walletRestored]);
 
   const transact: RunTransaction = async (label, fn) => {
-    setLoading(true);
+    setTransactionLoading(true);
     try {
       const out = await fn();
       notify(
         "ok",
         `${label} confirmed${out?.hash ? ` · ${short(out.hash, 8, 8)}` : ""}`
       );
-      await refresh();
+
+      const nextProtocol = await loadCommonData(address);
+      await loadCurrentRoute(tab, address, nextProtocol);
     } catch (error) {
       notify("error", error instanceof Error ? error.message : String(error));
     } finally {
-      setLoading(false);
+      setTransactionLoading(false);
     }
   };
 
@@ -683,12 +837,12 @@ function App() {
               <button
                 className="btn-secondary"
                 onClick={() => void refresh()}
-                disabled={loading}
+                disabled={refreshing || transactionLoading}
                 aria-label="Refresh data"
               >
                 <RefreshCw
                   size={16}
-                  className={loading ? "animate-spin" : ""}
+                  className={refreshing ? "animate-spin" : ""}
                 />
               </button>
               <button
@@ -747,11 +901,15 @@ function App() {
               run={transact}
             />
           )}
+          {/* <Loader2 className="animate-spin text-cyan-300" size={38} /> */}
         </main>
       </div>
 
-      {loading && (
-        <div className="pointer-events-none fixed inset-0 z-20 grid place-items-center bg-slate-950/25">
+      {(initialLoading ||
+        transactionLoading ||
+        positionsLoading ||
+        keeperLoading) && (
+        <div className="pointer-events-none fixed inset-y-0 left-0 right-0 z-20 grid place-items-center bg-slate-950/25 lg:left-72">
           <Loader2 className="animate-spin text-cyan-300" size={38} />
         </div>
       )}
