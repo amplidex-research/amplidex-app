@@ -87,7 +87,7 @@ type KeeperStateView = {
 const BPS_SCALE = 10_000n;
 const XLM_FEE_RESERVE = 10_000_000n; // 1 XLM at 7 decimals.
 const ROUTES: Record<Tab, string> = {
-  dashboard: "/dashboard",
+  dashboard: "/",
   trade: "/trade",
   pool: "/liquidity",
   positions: "/positions",
@@ -171,7 +171,7 @@ function calculateSupplyAprBps(
 
 function tabFromLocation(): Tab {
   if (typeof window === "undefined") return "dashboard";
-  const path = window.location.pathname.replace(/\/$/, "") || "/dashboard";
+  const path = window.location.pathname.replace(/\/$/, "") || "/";
   return (
     (Object.entries(ROUTES).find(([, route]) => route === path)?.[0] as Tab) ??
     "dashboard"
